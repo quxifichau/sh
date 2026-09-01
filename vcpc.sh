@@ -1,10 +1,10 @@
-set -x
-
 apt-get update && apt-get install -y tigervnc-standalone-server novnc websockify fluxbox x11-utils fonts-liberation
  
-sudo apt-get update
-wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-sudo apt install ./google-chrome-stable_current_amd64.deb 
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+wget -O /tmp/google-chrome-stable_current_amd64.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+dpkg -i /tmp/google-chrome-stable_current_amd64.deb
+apt-get install -y -f
 rm -rf ~/tmp/cdp
 mkdir -p ~/tmp/cdp
  
