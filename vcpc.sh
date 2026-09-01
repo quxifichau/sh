@@ -5,8 +5,8 @@ apt-get update -y
 wget -O /tmp/google-chrome-stable_current_amd64.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
 dpkg -i /tmp/google-chrome-stable_current_amd64.deb
 apt-get install -y -f
-rm -rf ~/tmp/cdp
-mkdir -p ~/tmp/cdp
+rm -rf ~/cdp
+mkdir -p ~/cdp
  
 npm install -g @playwright/cli@latest
 mkdir -p ~/.playwright
@@ -54,7 +54,7 @@ vnc() {
 chpw() {
   pkill -f google-chrome-stable; pkill -f playwright-cli
   google-chrome-stable \
-      --user-data-dir=$HOME/tmp/cdp \
+      --user-data-dir=$HOME/cdp \
       --remote-debugging-port=9222 \
       --remote-debugging-address=0.0.0.0 \
       --window-size=800,600 \
@@ -66,8 +66,8 @@ chpw() {
 }
 FUNCTION
 
-echo 'source ~/.functions.sh' >> ~/.zshrc
-echo 'source ~/.functions.sh' >> ~/.bashrc
+echo '. ~/.functions.sh' >> ~/.zshrc
+echo '. ~/.functions.sh' >> ~/.bashrc
 
 . ~/.bashrc
 . ~/.zshrc
