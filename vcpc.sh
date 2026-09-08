@@ -66,8 +66,8 @@ chpw() {
 }
 FUNCTION
 
-echo '. ~/.functions.sh' >> ~/.zshrc
-echo '. ~/.functions.sh' >> ~/.bashrc
+grep -qxF '. ~/.functions.sh' ~/.zshrc || echo '. ~/.functions.sh' >> ~/.zshrc
+grep -qxF '. ~/.functions.sh' ~/.bashrc || echo '. ~/.functions.sh' >> ~/.bashrc
 
 . ~/.bashrc
 . ~/.zshrc
