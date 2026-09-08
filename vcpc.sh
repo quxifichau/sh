@@ -62,7 +62,7 @@ chpw() {
       --disable-gpu \
       --no-first-run \
       --no-sandbox \
-      "https://example.com" &
+      "https://example.com" chrome.log 2>&1 &
 }
 FUNCTION
 
