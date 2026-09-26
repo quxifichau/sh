@@ -1,5 +1,11 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+# 兼容 POSIX sh（dash/busybox ash 等）：若被 sh 直接调用也能正常运行。
+# 注意：dash 不支持 pipefail，故仅在 bash/zsh/ksh 下启用。
+set -eu
+case "${BASH_VERSION:-}${ZSH_VERSION:-}${KSH_VERSION:-}" in
+  "") : ;;
+  *) set -o pipefail ;;
+esac
 
 # ==========================================
 # 1. 架构检测与映射
@@ -51,8 +57,8 @@ require_root() {
 # 3. 辅助函数：网络下载
 # ==========================================
 download_file() {
-  local url="$1"
-  local dest="$2"
+  url="$1"
+  dest="$2"
   if command -v curl >/dev/null 2>&1; then
     curl -fL --progress-bar "$url" -o "$dest"
   elif command -v wget >/dev/null 2>&1; then
@@ -72,7 +78,7 @@ get_latest_version() {
     return
   fi
 
-  local version=""
+  version=""
   # 通过跟踪 release/latest 302 重定向获取最新 tag，不依赖 API 配额与 jq
   if command -v curl >/dev/null 2>&1; then
     version=$(curl -fsSLI -o /dev/null -w "%{url_effective}" https://github.com/tailscale/tailcat/releases/latest 2>/dev/null | awk -F'/' '{print $NF}')
@@ -175,7 +181,8 @@ else
   chmod +x "$BIN_PATH"
 
   TARGET_DIR="/usr/local/bin"
-  if [ -w "$TARGET_DIR" ]; then
+  # 无 root/sudo 时直接安装到用户目录（/usr/local/bin 通常需要提权，避免触发 sudo 密码提示）
+  if [ "$(id -u)" -eq 0 ] && [ -w "$TARGET_DIR" ]; then
     install -m 755 "$BIN_PATH" "$TARGET_DIR/tailcat"
     echo "[+] 已成功安装至 $TARGET_DIR/tailcat"
   elif [ -n "$SUDO" ]; then
@@ -186,10 +193,14 @@ else
     mkdir -p "$TARGET_DIR"
     install -m 755 "$BIN_PATH" "$TARGET_DIR/tailcat"
     echo "[!] 无系统目录写入权限，已安装至 $TARGET_DIR/tailcat"
-    if [[ ":$PATH:" != *":$TARGET_DIR:"* ]]; then
-      echo "[!] 提示: 请将 $TARGET_DIR 加入你的 PATH 环境变量中:"
-      echo "    export PATH=\"\$PATH:$TARGET_DIR\""
-    fi
+    # POSIX sh 与 bash 通用：用 case 字符串匹配检查 PATH
+    case ":$PATH:" in
+      *":$TARGET_DIR:"*) : ;;
+      *)
+        echo "[!] 提示: 请将 $TARGET_DIR 加入你的 PATH 环境变量中:"
+        echo "    export PATH=\"\$PATH:$TARGET_DIR\""
+        ;;
+    esac
   fi
 fi
 
