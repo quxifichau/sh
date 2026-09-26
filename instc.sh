@@ -88,18 +88,20 @@ get_latest_version() {
     fi
   fi
 
-  # 验证版本号格式是否合法
-  if ! echo "$version" | grep -qE '^v?[0-9]+\.[0-9]+'; then
-    echo "[!] 版本号格式异常: '${version:-空}', 使用兜底版本 v0.7.0" >&2
+  # 验证版本号格式是否合法（注意：本函数输出经命令替换捕获，
+  # 警告信息必须显式重定向到 stderr，否则用户将看不到）
+  if ! printf '%s' "$version" | grep -qE '^v?[0-9]+\.[0-9]+(\.[0-9]+)?([-+][0-9A-Za-z.-]+)?$'; then
+    printf '[!] 版本号格式异常: %s, 使用兜底版本 v0.7.0\n' "'${version:-空}'" >&2
     version="v0.7.0"
   fi
 
   echo "${version#v}"
 }
 
-# 创建临时工作目录并确保清理
-TMP_DIR=$(mktemp -d)
-trap 'rm -rf "$TMP_DIR"' EXIT
+# 创建临时工作目录并确保清理（兼容 Bash 3.x，不使用 ${var,,} 等 4.x 扩展）
+TMP_DIR=$(mktemp -d) || { echo "[-] 无法创建临时目录" >&2; exit 1; }
+cleanup() { [ -n "${TMP_DIR:-}" ] && rm -rf "$TMP_DIR"; }
+trap cleanup EXIT INT TERM
 
 # ==========================================
 # 5. 执行环境检测与安装 (原生包管理器优先)
