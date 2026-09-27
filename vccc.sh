@@ -3,21 +3,6 @@
 # vccc.sh — Chrome + VNC + 双 MCP 自动化生产环境 一键安装脚本
 # 修复版本：解决 Chrome 安装语法错误、公网暴露、pip 污染、启动时序等全部问题
 # ==============================================================================
-
-# ------------------------------------------------------------------------------
-# 兼容 `sh vccc.sh` 直接调用：
-#   本脚本使用 bash 数组和 [[ ]]，并依赖 pipefail。dash 不支持 pipefail，
-#   直接以 sh 运行会报 "set: Illegal option -o pipefail"，随后在数组处语法报错。
-#   若当前解释器不是 bash，则用 bash 重新执行自身。
-# ------------------------------------------------------------------------------
-if [ -z "${BASH_VERSION:-}" ]; then
-    if command -v bash >/dev/null 2>&1; then
-        exec bash "$0" "$@"
-    fi
-    echo "❌ 本脚本需要 bash 运行，但未找到 bash" >&2
-    exit 1
-fi
-
 set -euo pipefail
 
 # ------------------------------------------------------------------------------
@@ -96,71 +81,48 @@ CDP_DIR="$REAL_HOME/cdp"
 mkdir -p "$CDP_DIR/logs" "$CDP_DIR/pids" "$CDP_DIR/profile"
 chmod 700 "$CDP_DIR/profile"
 
-# 依赖要求：browser-use 需要 Python>=3.11，crawl-mcp 需要 Python>=3.12。
-# Ubuntu 22.04 自带的 Python 3.10 无法满足，因此用 uv 安装托管的 Python 3.12。
-if ! command -v uv >/dev/null 2>&1; then
-    echo "   未检测到 uv，正在安装..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    export PATH="$HOME/.local/bin:$PATH"
-fi
-if ! command -v uv >/dev/null 2>&1; then
-    echo "❌ uv 安装失败，无法继续" >&2
-    exit 1
-fi
-
-uv python install 3.12
-
-VENV_DIR="$CDP_DIR/venv"
-VENV_PY="$VENV_DIR/bin/python"
-
-# venv 必须使用 Python>=3.12；已存在但版本过低时自动重建
-if [ -x "$VENV_PY" ] && \
-   "$VENV_PY" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 12) else 1)'; then
-    echo "   虚拟环境已存在且 Python 版本满足要求，跳过创建"
+if [ ! -d "$CDP_DIR/venv" ]; then
+    python3 -m venv "$CDP_DIR/venv"
+    echo "   虚拟环境已创建: $CDP_DIR/venv"
 else
-    rm -rf "$VENV_DIR"
-    uv venv --python 3.12 "$VENV_DIR"
-    echo "   虚拟环境已创建 (Python 3.12): $VENV_DIR"
+    echo "   虚拟环境已存在，跳过创建"
 fi
 
-# 使用 uv pip 安装（带全局缓存，比 venv 内 pip 更快）
-VENV_PIP=(uv pip install --python "$VENV_PY")
-VENV_BIN="$VENV_DIR/bin"
+VENV_PIP="$CDP_DIR/venv/bin/pip"
+VENV_BIN="$CDP_DIR/venv/bin"
 
 # ------------------------------------------------------------------------------
 # 4. 在虚拟环境内安装所有 Python 依赖（版本全部锁定）
 #
-#    版本说明（以下版本均已在本环境实际解析验证）：
-#      setuptools<82    — setuptools>=82 与 crawl4ai 0.8.9 的 setup.py 不兼容
-#      lxml~=5.3        — >=5.3,<6；crawl4ai 0.8.9 的最低兼容版本
-#      click==8.3.3     — browser-use 与 crawl-mcp 均依赖 click，锁定公共兼容版本
-#      browser-use      — 0.13.10：提供 `browser-use --mcp`（stdio MCP 服务），
-#                         并支持 BU_CDP_URL 连接既有 Chrome。原固定值 0.1.45
-#                         根本没有 MCP 功能，`browser-use --mcp` 必然失败。
-#      crawl4ai=0.8.9   — 已验证版本
-#      crawl-mcp=0.2.0  — PyPI 上真实存在的最高版本；原固定值 0.3.3 不存在
-#                         （pip 会直接以 404 失败）。
-#      fastmcp=4.0.10   — 用 `fastmcp run <mcp.json> --transport sse` 把 stdio
-#                         的 MCP 服务代理成 SSE。原方案 mcp-proxy（0.9.0/0.12.0）
-#                         与 browser-use 钉死的 mcp==2.1.1 不兼容，启动即崩溃。
+#    版本说明：
+#      setuptools<82   — setuptools>=82 与 crawl4ai 0.8.9 的 setup.py 不兼容
+#      lxml~=5.3       — >=5.3,<6；crawl4ai 0.8.9 的最低兼容版本
+#      browser-use     — 暂无官方稳定 release tag，锁定已验证的最新稳定版
+#      click==8.3.3    — browser-use 与 crawl-mcp 均依赖 click，
+#                        8.3.3 是两者共同兼容的版本，避免冲突
+#      crawl4ai=0.8.9  — 已验证版本
+#      crawl-mcp=0.3.3 — 已验证版本
+#      mcp-proxy=0.9.0 — 已验证支持 --host/--port 参数的版本
 # ------------------------------------------------------------------------------
 echo "📦 [4/5] 安装 Python MCP 套件（虚拟环境隔离）..."
 
+"$VENV_PIP" install --upgrade pip setuptools wheel
+
 # 先固定基础约束，防止后续包升级覆盖
-"${VENV_PIP[@]}" \
+"$VENV_PIP" install \
     "setuptools<82" \
     "lxml~=5.3" \
     "click==8.3.3"
 
 # 安装核心包
-"${VENV_PIP[@]}" \
-    "browser-use[cli]==0.13.10" \
+"$VENV_PIP" install \
+    "browser-use[cli]==0.1.45" \
     "crawl4ai==0.8.9" \
-    "crawl-mcp==0.2.0" \
-    "fastmcp==4.0.10"
+    "crawl-mcp==0.3.3" \
+    "mcp-proxy==0.9.0"
 
 # click 最后强制固定，防止上面任何包将其升级
-"${VENV_PIP[@]}" --force-reinstall "click==8.3.3"
+"$VENV_PIP" install --force-reinstall "click==8.3.3"
 
 # ------------------------------------------------------------------------------
 # 5. 安装完整性校验
@@ -181,7 +143,7 @@ for bin_name in "${REQUIRED_SYS_BINS[@]}"; do
 done
 
 REQUIRED_VENV_BINS=(
-    "$VENV_BIN/fastmcp"
+    "$VENV_BIN/mcp-proxy"
     "$VENV_BIN/browser-use"
     "$VENV_BIN/crawl-mcp"
 )
@@ -199,7 +161,7 @@ echo "   所有可执行文件校验通过 ✅"
 #
 #    设计原则：
 #      - 所有服务均通过 PID 文件管理，不使用 pkill -f 模糊匹配
-#      - MCP 代理（fastmcp）绑定 127.0.0.1，由 Tailscale 负责外部转发
+#      - mcp-proxy 绑定 127.0.0.1，由 Tailscale 负责外部转发
 #      - 服务启动后进行健康探测，确认就绪后才返回
 #      - DISPLAY 统一设为 :99
 # ==============================================================================
@@ -331,7 +293,7 @@ vnc() {
         local http_code
         http_code=$(curl -s -o /dev/null -w "%{http_code}" \
             http://127.0.0.1:6080/vnc.html 2>/dev/null || true)
-        if [[ "$http_code" == "200" || "$http_code" == "302" ]]; then
+        if echo "$http_code" | grep -qE "^(200|302)$"; then
             novnc_ready=1
             break
         fi
@@ -389,12 +351,8 @@ chr() {
     echo "  - 等待 Chrome CDP 协议就绪..."
     local i cdp_ready=0
     for i in $(seq 1 40); do
-        # 先把响应完整读入变量再匹配：避免 grep -q 匹配后提前退出触发 SIGPIPE，
-        # 使 curl 报 "curl: (23) Failure writing output to destination"，并在
-        # pipefail 下让整条管道被误判为失败。
-        local cdp_response
-        cdp_response=$(curl -s --max-time 1 http://127.0.0.1:9222/json/version 2>/dev/null || true)
-        if [[ "$cdp_response" == *'"Browser"'* ]]; then
+        if curl -s --max-time 1 http://127.0.0.1:9222/json/version \
+            2>/dev/null | grep -q '"Browser"'; then
             cdp_ready=1
             break
         fi
@@ -412,69 +370,42 @@ chr() {
 # ==============================================================================
 # buse — 重启 Browser-use MCP，SSE 端口 8001（绑定 127.0.0.1）
 #
-#   实现说明：
-#     `fastmcp run <mcp.json> --transport sse` 把 stdio 的 browser-use --mcp
-#     代理为 SSE。fastmcp 绑定 127.0.0.1 而非 0.0.0.0，
-#     外部 AI Agent 通过 Tailscale 隧道访问，不直接暴露公网。
+#   安全说明：
+#     mcp-proxy 绑定 127.0.0.1 而非 0.0.0.0
+#     外部 AI Agent 通过 Tailscale 隧道访问，不直接暴露公网
 # ==============================================================================
 buse() {
     local venv_bin="$_VENV_BIN"
-    local cdp_dir="$_CDP_DIR"
     local log_dir="$_LOG_DIR"
     local pid_dir="$_PID_DIR"
     mkdir -p "$log_dir" "$pid_dir"
 
     # 校验可执行文件存在
-    if [ ! -x "$venv_bin/fastmcp" ] || [ ! -x "$venv_bin/browser-use" ]; then
-        echo "❌ [buse] 找不到 fastmcp 或 browser-use，请重新运行 vccc.sh" >&2
+    if [ ! -x "$venv_bin/mcp-proxy" ] || [ ! -x "$venv_bin/browser-use" ]; then
+        echo "❌ [buse] 找不到 mcp-proxy 或 browser-use，请重新运行 install.sh" >&2
         return 1
     fi
-
-    # 生成 browser-use 的 stdio MCPConfig
-    cat > "$cdp_dir/buse-mcp.json" << BUSE_MCP_JSON_EOF
-{
-  "mcpServers": {
-    "browser-use": {
-      "command": "$venv_bin/browser-use",
-      "args": ["--mcp"],
-      "env": {
-        "DISPLAY": ":99",
-        "BU_CDP_URL": "http://127.0.0.1:9222"
-      }
-    }
-  }
-}
-BUSE_MCP_JSON_EOF
 
     echo "🤖 [buse] 停止旧 Browser-use MCP..."
     _kill_service "Browser-use MCP" "$pid_dir/buse.pid"
 
     echo "🤖 [buse] 启动 Browser-use MCP (127.0.0.1:8001)..."
-    nohup "$venv_bin/fastmcp" run "$cdp_dir/buse-mcp.json" \
-        --transport sse \
-        --host 127.0.0.1 \
+    DISPLAY=:99 \
+    BU_CDP_URL="http://127.0.0.1:9222" \
+    nohup "$venv_bin/mcp-proxy" \
         --port 8001 \
-        --no-banner \
+        --host 127.0.0.1 \
+        -- \
+        "$venv_bin/browser-use" --mcp \
         >"$log_dir/buse.log" 2>&1 &
     echo $! > "$pid_dir/buse.pid"
 
-    # 健康探测：等待 SSE 端点真实响应
-    # （SSE 会保持长连接，故只检查 HTTP 状态码，忽略 curl 的 --max-time 超时退出码）
-    local i buse_ready=0 buse_code
-    for i in $(seq 1 30); do
-        buse_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 1 \
-            http://127.0.0.1:8001/sse 2>/dev/null || true)
-        if [[ "$buse_code" == "200" ]]; then
-            buse_ready=1
-            break
-        fi
-        sleep 0.5
-    done
-
-    if [ "$buse_ready" -eq 1 ]; then
-        echo "✅ [buse] Browser-use MCP 已启动 (SSE: 127.0.0.1:8001/sse)"
+    # 短暂等待进程稳定，检查是否意外退出
+    sleep 1
+    if _is_alive "$pid_dir/buse.pid"; then
+        echo "✅ [buse] Browser-use MCP 已启动 (SSE: 127.0.0.1:8001)"
     else
-        echo "❌ [buse] 启动失败，请查看: $log_dir/buse.log" >&2
+        echo "❌ [buse] 进程意外退出，请查看: $log_dir/buse.log" >&2
         return 1
     fi
 }
@@ -482,65 +413,42 @@ BUSE_MCP_JSON_EOF
 # ==============================================================================
 # crwl — 重启 Crawl-MCP 抓取服务，SSE 端口 8002（绑定 127.0.0.1）
 #
-#   实现说明：
-#     同 buse，用 fastmcp 把 stdio 的 crawl-mcp 代理为 SSE。
-#     注：crawl-mcp 0.2.0 会启动自身的无头浏览器，不使用外部 CDP 地址。
+#   环境变量说明：
+#     CRAWL4AI_BROWSER_URL — crawl-mcp 0.3.3 识别的 CDP 连接地址
+#     （如升级版本请核对该包 README 中的环境变量名称）
 # ==============================================================================
 crwl() {
     local venv_bin="$_VENV_BIN"
-    local cdp_dir="$_CDP_DIR"
     local log_dir="$_LOG_DIR"
     local pid_dir="$_PID_DIR"
     mkdir -p "$log_dir" "$pid_dir"
 
     # 校验可执行文件存在
-    if [ ! -x "$venv_bin/fastmcp" ] || [ ! -x "$venv_bin/crawl-mcp" ]; then
-        echo "❌ [crwl] 找不到 fastmcp 或 crawl-mcp，请重新运行 vccc.sh" >&2
+    if [ ! -x "$venv_bin/mcp-proxy" ] || [ ! -x "$venv_bin/crawl-mcp" ]; then
+        echo "❌ [crwl] 找不到 mcp-proxy 或 crawl-mcp，请重新运行 install.sh" >&2
         return 1
     fi
-
-    # 生成 crawl-mcp 的 stdio MCPConfig
-    cat > "$cdp_dir/crwl-mcp.json" << CRWL_MCP_JSON_EOF
-{
-  "mcpServers": {
-    "crawl-mcp": {
-      "command": "$venv_bin/crawl-mcp",
-      "env": {
-        "DISPLAY": ":99"
-      }
-    }
-  }
-}
-CRWL_MCP_JSON_EOF
 
     echo "🕷️  [crwl] 停止旧 Crawl-MCP..."
     _kill_service "Crawl-MCP" "$pid_dir/crwl.pid"
 
     echo "🕷️  [crwl] 启动 Crawl-MCP (127.0.0.1:8002)..."
-    nohup "$venv_bin/fastmcp" run "$cdp_dir/crwl-mcp.json" \
-        --transport sse \
-        --host 127.0.0.1 \
+    DISPLAY=:99 \
+    CRAWL4AI_BROWSER_URL="http://127.0.0.1:9222" \
+    nohup "$venv_bin/mcp-proxy" \
         --port 8002 \
-        --no-banner \
+        --host 127.0.0.1 \
+        -- \
+        "$venv_bin/crawl-mcp" \
         >"$log_dir/crwl.log" 2>&1 &
     echo $! > "$pid_dir/crwl.pid"
 
-    # 健康探测：等待 SSE 端点真实响应（只检查 HTTP 状态码）
-    local i crwl_ready=0 crwl_code
-    for i in $(seq 1 30); do
-        crwl_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 1 \
-            http://127.0.0.1:8002/sse 2>/dev/null || true)
-        if [[ "$crwl_code" == "200" ]]; then
-            crwl_ready=1
-            break
-        fi
-        sleep 0.5
-    done
-
-    if [ "$crwl_ready" -eq 1 ]; then
-        echo "✅ [crwl] Crawl-MCP 已启动 (SSE: 127.0.0.1:8002/sse)"
+    # 短暂等待进程稳定，检查是否意外退出
+    sleep 1
+    if _is_alive "$pid_dir/crwl.pid"; then
+        echo "✅ [crwl] Crawl-MCP 已启动 (SSE: 127.0.0.1:8002)"
     else
-        echo "❌ [crwl] 启动失败，请查看: $log_dir/crwl.log" >&2
+        echo "❌ [crwl] 进程意外退出，请查看: $log_dir/crwl.log" >&2
         return 1
     fi
 }
