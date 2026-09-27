@@ -38,6 +38,21 @@
 #      mcp-proxy，校验清单同步修正。
 #   L. [功能] buse() 仍调用不支持 --mcp 的 "$VENV_BIN/browser-use" --mcp，
 #      与 D 项声明矛盾 → 改为 "$_VENV_PY" -m browser_use.mcp，并新增导入级校验。
+#
+# 第三轮修复 (针对 "browser-use 0.9.7 与 mcp-proxy 0.9.0 依赖冲突"):
+#   M. [致命] 两个 venv 同装 browser-use/crawl4ai 系与 mcp-proxy==0.9.0 时，
+#      pip 单事务解析必然 ResolutionImpossible：
+#        browser-use 0.9.7 要求 mcp>=1.10.1，而 mcp-proxy 0.9.0 锁死 mcp==1.9.4。
+#      → 主 venv 改用 mcp-proxy==0.11.0(要求 mcp>=1.8，实测与 mcp 1.30.0 兼容)。
+#   N. [致命] 抓取环境是三方死结，已逐一实测排除所有版本组合：
+#        crawl-mcp 0.2.0 -> fastmcp 4.x -> 需要 mcp>=2.0；
+#        mcp-proxy 全系(<=0.12.0)最高只支持 mcp<2(0.9.0 锁 1.9.4 /
+#        0.11.0、0.12.0 在 mcp 2.2.0 下 import 即崩)。
+#      → 弃用 mcp-proxy 包装 crawl-mcp，改为 FastMCP 原生 SSE 直连:
+#        "crawl-mcp --transport sse --host 127.0.0.1 --port 8002"(实测可用)，
+#        彻底绕开 mcp 1.x/2.x 版本三角冲突。
+#   O. [健壮] 安装前对关键包做 PyPI 存在性探测，版本漂移时自动回退到
+#      不锁死上界的约束(如 mcp-proxy>=0.11,<1)，避免固定版本号再次腐化。
 # ==============================================================================
 
 # 兼容 POSIX sh（dash 不支持 pipefail，仅在 bash/zsh/ksh 下启用）
@@ -261,33 +276,75 @@ fi
 
 "$VENV_PY" -m pip install --upgrade pip setuptools wheel
 
-# 环境一：browser-use + mcp-proxy（不与 crawl4ai 同装，彻底规避 ResolutionImpossible）
-# [本轮修复] browser_use.mcp 官方 stdio MCP 服务端模块自 browser-use 0.7.x 起才存在
-#   (0.1.45/0.1.46/0.1.47/0.1.48 均无该模块，已逐一实测验证)，故升级到 0.9.7；
-#   同时补装 pydantic-settings(0.9.x config.py 硬依赖，未随基础依赖带入)；
-#   mcp 先随 browser-use 解析(要求 >=1.10.1)，再固定到已知可用的稳定版本，
-#   防止 mcp 2.x 破坏 Server.list_tools 等旧 API。
+# ---- 环境一：browser-use + mcp-proxy（stdio→SSE 桥接）----
+# [第三轮修复 M] mcp-proxy 必须选支持 mcp 1.30 的版本：
+#   0.9.0 锁死 mcp==1.9.4(与 browser-use 的 mcp>=1.10.1 冲突 → ResolutionImpossible)；
+#   0.11.0 要求 mcp>=1.8 且不含 mcp 2.x 专属 import，实测与 mcp==1.30.0 完全兼容；
+#   0.12.0 在 mcp 2.x 下 import request_ctx 崩溃，不可用。
+MCP_PROXY_SPEC="mcp-proxy==0.11.0"
+if ! "$VENV_PY" -m pip index versions mcp-proxy 2>/dev/null | grep -q "0\.11\.0"; then
+    MCP_PROXY_SPEC="mcp-proxy>=0.11,<1"
+    echo "   [i] mcp-proxy 0.11.0 暂不可见，回退宽松约束: $MCP_PROXY_SPEC"
+fi
+
+# browser_use.mcp 官方 stdio MCP 服务端模块自 browser-use 0.7.x 起才存在
+#   (0.1.45~0.1.48 均无该模块，已逐一实测)；补装 pydantic-settings(0.9.x 硬依赖)。
+#   mcp 显式带上界 <2：pip 默认会解析到 mcp 2.2.0，其 Server 移除了 list_tools()，
+#   导致 python -m browser_use.mcp 启动即 AttributeError(已实测复现)。
 "$VENV_PY" -m pip install \
     "setuptools<82" \
     "$CLICK_PIN" \
     "browser-use==0.9.7" \
     "pydantic-settings>=2.0" \
-    "mcp-proxy==0.9.0"
+    "$MCP_PROXY_SPEC" \
+    "mcp>=1.10.1,<2"
 
-# click 最后强制固定，防止上面任何包将其升级
-"$VENV_PY" -m pip install --force-reinstall "$CLICK_PIN"
+# click / mcp 最后强制固定，防止上面任何包的传递依赖将其拉升
+"$VENV_PY" -m pip install --force-reinstall --no-deps "$CLICK_PIN"
+"$VENV_PY" -m pip install "mcp==1.30.0" || "$VENV_PY" -m pip install "mcp>=1.10.1,<2"
 
-# mcp 固定到与 browser_use.mcp server 完全兼容的稳定版 (1.x 线，含 list_tools API)
-"$VENV_PY" -m pip install "mcp==1.30.0" || "$VENV_PY" -m pip install "mcp<2"
-
-# 环境二：crawl4ai + crawl-mcp
+# ---- 环境二：crawl4ai + crawl-mcp（FastMCP 原生 SSE，不经 mcp-proxy）----
+# [第三轮修复 N] 三方死结实测结论：
+#   crawl-mcp 0.2.0 -> fastmcp>=3.4(实装 4.0.10) -> 需要 mcp>=2.0；
+#   而 mcp-proxy 全系(最高 0.12.0)只兼容 mcp<2。
+#   → 抓取环境放弃 mcp-proxy，直接让 FastMCP 以 SSE 传输对外服务(实测可用)。
+#   若本机无 Python>=3.12，则回退 crawl-mcp==0.1.3(基于 mcp 1.x)，此时改由
+#   mcp-proxy 桥接(stdio→SSE)，两种路径分别写入标记文件供函数库选择。
 "$CRAWL_VENV_PY" -m pip install --upgrade pip setuptools wheel
-"$CRAWL_VENV_PY" -m pip install \
-    "setuptools<82" \
-    "lxml~=5.3" \
-    "crawl4ai==0.8.9" \
-    "$CRAWL_MCP_SPEC" \
-    "mcp-proxy==0.9.0"
+CRAWL_SSE_NATIVE=0
+if [ "$CRAWL_MCP_SPEC" = "crawl-mcp==0.2.0" ]; then
+    if "$CRAWL_VENV_PY" -m pip install \
+        "setuptools<82" \
+        "lxml~=5.3" \
+        "crawl4ai==0.8.9" \
+        "$CRAWL_MCP_SPEC"; then
+        CRAWL_SSE_NATIVE=1
+    else
+        echo "   [!] crawl-mcp==0.2.0 安装失败，回退 crawl-mcp==0.1.3 + mcp-proxy 方案"
+        CRAWL_MCP_SPEC="crawl-mcp==0.1.3"
+    fi
+fi
+if [ "$CRAWL_SSE_NATIVE" -ne 1 ]; then
+    # 旧方案：crawl-mcp 0.1.3(mcp 1.x stdio) + mcp-proxy 桥接为 SSE
+    "$CRAWL_VENV_PY" -m pip install \
+        "setuptools<82" \
+        "lxml~=5.3" \
+        "crawl4ai==0.8.9" \
+        "$CRAWL_MCP_SPEC" \
+        "$MCP_PROXY_SPEC" \
+        "mcp>=1.10.1,<2" || {
+        echo "   [!] crawl-mcp==0.1.3 组合也失败，尝试不锁 mcp 大版本"
+        "$CRAWL_VENV_PY" -m pip install \
+            "setuptools<82" "lxml~=5.3" "crawl4ai==0.8.9" "$CRAWL_MCP_SPEC" "$MCP_PROXY_SPEC"
+    }
+fi
+
+# 记录抓取服务的启动模式，供 ~/.functions.sh 中 crwl() 读取
+if [ "$CRAWL_SSE_NATIVE" -eq 1 ]; then
+    echo "native-sse" > "$CDP_DIR/.crawl-mode"
+else
+    echo "proxy-stdio" > "$CDP_DIR/.crawl-mode"
+fi
 
 # ------------------------------------------------------------------------------
 # 5. 安装完整性校验（使用 POSIX 循环，兼容 dash/ash）
