@@ -25,6 +25,19 @@
 #      避免 shebang 失效引发 "pip: not found"。
 #   H. [细节] 第 194 行 `$VENV_PY --version` 未加引号(变量含空格会分词)已修复；
 #      st() 内部 _probe 定义提前到函数体开头，POSIX sh 首次调用即完整可用。
+#
+# 第二轮修复 (针对 "browser_use.mcp 模块缺失" 实测失败):
+#   I. [致命] browser-use 0.1.45/0.1.46/0.1.47/0.1.48 均不内置 browser_use.mcp
+#      子包(已逐一安装实测)，该官方 stdio MCP 服务端自 0.7.x 起才提供。
+#      → 主 venv 升级安装 browser-use==0.9.7，并补装其硬依赖 pydantic-settings。
+#   J. [兼容] pip 默认将 mcp 解析到 2.2.0，其 Server 类移除了 list_tools()，
+#      导致 python -m browser_use.mcp 启动即 AttributeError 崩溃。
+#      → 安装后固定 mcp==1.30.0(回退 <2)，实测 stdio 服务可正常拉起。
+#   K. [致命] crwl() 误用主 venv 路径($_VENV_BIN)查找 crawl-mcp/mcp-proxy，而
+#      二者安装在 ~/cdp/venv-crawl → 改用 $_CRAWL_VENV_BIN，并在抓取环境补装
+#      mcp-proxy，校验清单同步修正。
+#   L. [功能] buse() 仍调用不支持 --mcp 的 "$VENV_BIN/browser-use" --mcp，
+#      与 D 项声明矛盾 → 改为 "$_VENV_PY" -m browser_use.mcp，并新增导入级校验。
 # ==============================================================================
 
 # 兼容 POSIX sh（dash 不支持 pipefail，仅在 bash/zsh/ksh 下启用）
@@ -249,14 +262,23 @@ fi
 "$VENV_PY" -m pip install --upgrade pip setuptools wheel
 
 # 环境一：browser-use + mcp-proxy（不与 crawl4ai 同装，彻底规避 ResolutionImpossible）
+# [本轮修复] browser_use.mcp 官方 stdio MCP 服务端模块自 browser-use 0.7.x 起才存在
+#   (0.1.45/0.1.46/0.1.47/0.1.48 均无该模块，已逐一实测验证)，故升级到 0.9.7；
+#   同时补装 pydantic-settings(0.9.x config.py 硬依赖，未随基础依赖带入)；
+#   mcp 先随 browser-use 解析(要求 >=1.10.1)，再固定到已知可用的稳定版本，
+#   防止 mcp 2.x 破坏 Server.list_tools 等旧 API。
 "$VENV_PY" -m pip install \
     "setuptools<82" \
     "$CLICK_PIN" \
-    "browser-use==0.1.45" \
+    "browser-use==0.9.7" \
+    "pydantic-settings>=2.0" \
     "mcp-proxy==0.9.0"
 
 # click 最后强制固定，防止上面任何包将其升级
 "$VENV_PY" -m pip install --force-reinstall "$CLICK_PIN"
+
+# mcp 固定到与 browser_use.mcp server 完全兼容的稳定版 (1.x 线，含 list_tools API)
+"$VENV_PY" -m pip install "mcp==1.30.0" || "$VENV_PY" -m pip install "mcp<2"
 
 # 环境二：crawl4ai + crawl-mcp
 "$CRAWL_VENV_PY" -m pip install --upgrade pip setuptools wheel
@@ -264,7 +286,8 @@ fi
     "setuptools<82" \
     "lxml~=5.3" \
     "crawl4ai==0.8.9" \
-    "$CRAWL_MCP_SPEC"
+    "$CRAWL_MCP_SPEC" \
+    "mcp-proxy==0.9.0"
 
 # ------------------------------------------------------------------------------
 # 5. 安装完整性校验（使用 POSIX 循环，兼容 dash/ash）
@@ -279,7 +302,7 @@ for bin_name in $REQUIRED_SYS_BINS; do
     fi
 done
 
-REQUIRED_VENV_BINS="$VENV_BIN/mcp-proxy $VENV_BIN/browser-use $CRAWL_VENV_BIN/crawl-mcp"
+REQUIRED_VENV_BINS="$VENV_BIN/mcp-proxy $CRAWL_VENV_BIN/crawl-mcp $CRAWL_VENV_BIN/mcp-proxy"
 for bin_path in $REQUIRED_VENV_BINS; do
     if [ ! -x "$bin_path" ]; then
         echo "❌ 缺少虚拟环境工具: $bin_path" >&2
@@ -287,11 +310,13 @@ for bin_path in $REQUIRED_VENV_BINS; do
     fi
 done
 
-# 校验 browser-use 官方 stdio MCP 入口模块真实存在（替代不支持的 --mcp TUI 参数）
-if ! "$VENV_PY" -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('browser_use.mcp') else 1)"; then
-    echo "❌ browser_use.mcp 模块缺失，MCP 服务无法启动" >&2
+# 校验 browser-use 官方 stdio MCP 入口模块真实存在且可导入（替代不支持的 --mcp TUI 参数）
+if ! "$VENV_PY" -c "import browser_use.mcp.server" 2>/dev/null; then
+    echo "❌ browser_use.mcp 模块缺失或不可导入，MCP 服务无法启动" >&2
+    "$VENV_PY" -c "import browser_use.mcp.server"  # 打印真实错误后由 set -e 退出
     exit 1
 fi
+echo "   [✓] browser_use.mcp 服务端模块可导入 ($(python3 -c 'pass' 2>/dev/null; "$VENV_PY" -m pip show browser-use 2>/dev/null | awk '/^Version/{print $2}'))"
 
 echo "   所有可执行文件校验通过 ✅"
 
@@ -308,6 +333,8 @@ cat > "$REAL_HOME/.functions.sh" << 'FUNCTION_EOF'
 # 全局路径常量
 _CDP_DIR="$HOME/cdp"
 _VENV_BIN="$HOME/cdp/venv/bin"
+_VENV_PY="$HOME/cdp/venv/bin/python3"
+_CRAWL_VENV_BIN="$HOME/cdp/venv-crawl/bin"
 _LOG_DIR="$HOME/cdp/logs"
 _PID_DIR="$HOME/cdp/pids"
 export DISPLAY=:99
@@ -499,8 +526,15 @@ buse() {
     local pid_dir="$_PID_DIR"
     mkdir -p "$log_dir" "$pid_dir"
 
-    if [ ! -x "$venv_bin/mcp-proxy" ] || [ ! -x "$venv_bin/browser-use" ]; then
-        echo "❌ [buse] 找不到 mcp-proxy 或 browser-use，请重新运行安装脚本" >&2
+    if [ ! -x "$venv_bin/mcp-proxy" ] || [ ! -x "$_VENV_PY" ]; then
+        echo "❌ [buse] 找不到 mcp-proxy 或 venv python3，请重新运行安装脚本" >&2
+        return 1
+    fi
+
+    # [本轮修复] browser-use 0.1.x 的 CLI 不支持 --mcp；改用官方 stdio MCP 入口
+    # python3 -m browser_use.mcp（由 browser-use>=0.7 提供，本脚本已安装 0.9.7）
+    if ! "$_VENV_PY" -c "import browser_use.mcp.server" 2>/dev/null; then
+        echo "❌ [buse] browser_use.mcp 模块不可导入，无法启动 MCP 服务" >&2
         return 1
     fi
 
@@ -509,12 +543,13 @@ buse() {
 
     echo "🤖 [buse] 启动 Browser-use MCP (127.0.0.1:8001)..."
     DISPLAY=:99 \
+    ANONYMIZED_TELEMETRY="false" \
     BU_CDP_URL="http://127.0.0.1:9222" \
     nohup "$venv_bin/mcp-proxy" \
         --port 8001 \
         --host 127.0.0.1 \
         -- \
-        "$venv_bin/browser-use" --mcp \
+        "$_VENV_PY" -m browser_use.mcp \
         >"$log_dir/buse.log" 2>&1 &
     echo $! > "$pid_dir/buse.pid"
 
@@ -531,11 +566,13 @@ buse() {
 # crwl — 重启 Crawl-MCP 抓取服务，SSE 端口 8002（绑定 127.0.0.1）
 # ==============================================================================
 crwl() {
-    local venv_bin="$_VENV_BIN"
+    local venv_bin="$_CRAWL_VENV_BIN"
     local log_dir="$_LOG_DIR"
     local pid_dir="$_PID_DIR"
     mkdir -p "$log_dir" "$pid_dir"
 
+    # [本轮修复] crawl4ai/crawl-mcp/mcp-proxy 位于独立环境 ~/cdp/venv-crawl，
+    # 原实现误用主 venv(~/cdp/venv)路径，导致找不到可执行文件
     if [ ! -x "$venv_bin/mcp-proxy" ] || [ ! -x "$venv_bin/crawl-mcp" ]; then
         echo "❌ [crwl] 找不到 mcp-proxy 或 crawl-mcp，请重新运行安装脚本" >&2
         return 1
@@ -546,6 +583,7 @@ crwl() {
 
     echo "🕷️  [crwl] 启动 Crawl-MCP (127.0.0.1:8002)..."
     DISPLAY=:99 \
+    ANONYMIZED_TELEMETRY="false" \
     CRAWL4AI_BROWSER_URL="http://127.0.0.1:9222" \
     nohup "$venv_bin/mcp-proxy" \
         --port 8002 \
