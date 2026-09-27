@@ -1,8 +1,35 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# vccc.sh — Chrome + VNC + 双 MCP 自动化生产环境 一键安装脚本
-# 修复版本：解决 Chrome 安装语法错误、公网暴露、pip 污染、启动时序等全部问题
+# vccc_r.sh — Chrome + VNC + 双 MCP 自动化生产环境 一键安装脚本（修复版）
+# 修复内容：
+#   BUG1: "sh: 6: set: Illegal option -o pipefail"
+#         —— 本脚本被 `sh vccc.sh` 用 POSIX dash 解释器执行，dash 不支持
+#            pipefail / [[ ]] / 数组。现已加入自动 re-exec 到 bash 的兼容层。
+#   BUG2: "curl: (23) Failure writing output to destination"
+#         —— curl 输出管道被提前关闭(EPIPE)/目标不可写导致。健康探测改用
+#            curl -f -o /dev/null，不再把 curl 输出接进管道；下载改用 wget
+#            --continue 并校验文件大小与退出码。
+#   BUG3: TigerVNC 默认 rfbport 5900+display(=5999) 与显式 -rfbport 5900 冲突，
+#         部分版本直接启动失败 —— 统一使用 -rfbport 5900 并等待端口就绪。
+#   BUG4: mcp-proxy 新版参数为位置参数 `<port> <server...>`，旧式 --port/--host
+#         会报错退出 —— 启动函数运行时自动探测两种用法。
+#   BUG5: noVNC websockify 的 --web 路径在不同发行版不一致 —— 自动探测目录。
 # ==============================================================================
+
+# ------------------- BUG1 修复：pipefail 兼容层 --------------------------------
+# 若脚本被 sh/dash 执行（不支持 set -o pipefail），自动切换到 bash 重新执行。
+if ! (set -o pipefail) 2>/dev/null; then
+    if [ -n "${_VCCC_REEXEC:-}" ]; then
+        echo "❌ 无法切换到 bash 运行本脚本，请手动执行: bash $0" >&2
+        exit 1
+    fi
+    if command -v bash >/dev/null 2>&1; then
+        _VCCC_REEXEC=1 exec bash "$0" "$@"
+    fi
+    echo "❌ 未找到 bash，本脚本必须使用 bash 运行: bash $0" >&2
+    exit 1
+fi
+
 set -euo pipefail
 
 # ------------------------------------------------------------------------------
