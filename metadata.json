@@ -1,8 +1,0 @@
-{
-  "name": "SH Automation Suite - Cloud Dev & MCP Control Center",
-  "description": "Interactive workbench and control center for Linux automation scripts: Tailcat installer, Chrome + VNC headless desktop, and Dual MCP (Browser-use & Crawl4ai) services.",
-  "permissions": [],
-  "capabilities": [
-    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
-  ]
-}
