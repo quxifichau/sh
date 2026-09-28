@@ -5,6 +5,32 @@
 #           并修正 Python 版本要求、MCP 包版本锁定，以及 MCP 服务的
 #           "假成功"健康检查（详见各段注释）
 # ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 0. 前置检查：确保用 bash 执行（必须放在 set -euo pipefail 之前，且此处只能用
+#    POSIX 语法，因为下面这段本身就是在 sh/dash 下运行的）
+#
+#    本脚本用到 bash 专有特性：pipefail、数组、[[ ]]、local。
+#    若被 `sh vccc.sh` 或 `curl ... | sh` 调用，dash 会在 `set -o pipefail`
+#    处报 "Illegal option" 并退出；管道形态下上游 curl 随即 EPIPE，报
+#    "curl: (23) Failure writing output to destination"。
+#    这里自动改用 bash 重新执行自身；若是从管道读入（无法重新执行）则给出明确指引。
+#
+#    支持的一键安装写法（管道安装，无需落盘）：
+#        curl -fsSL <脚本地址> | sudo bash
+#    脚本内所有外部命令均已加 </dev/null，不会与脚本流抢占 stdin，可安全管道执行。
+# ------------------------------------------------------------------------------
+if [ -z "${BASH_VERSION:-}" ]; then
+    if [ -f "$0" ] && [ -r "$0" ]; then
+        exec bash "$0" "$@"
+    fi
+    echo "❌ 本脚本需要 bash 运行（当前 shell 是 sh/dash）。推荐的一键安装命令：" >&2
+    echo "     curl -fsSL <脚本地址> | sudo bash" >&2
+    echo "   已落盘的脚本请用：" >&2
+    echo "     sudo bash vccc.sh" >&2
+    exit 1
+fi
+
 set -euo pipefail
 
 # ------------------------------------------------------------------------------
@@ -23,9 +49,13 @@ echo "=================================================="
 # 1. 基础系统依赖（使用系统包管理器，不污染系统 pip）
 # ------------------------------------------------------------------------------
 echo "📦 [1/5] 安装系统依赖..."
+#
+# 说明：脚本内所有外部命令都显式加 </dev/null。原因见文件顶部「管道安装」注释：
+#       用 `curl ... | bash` 安装时，stdin 就是脚本流本身，任何子进程一旦去读
+#       stdin，就会把还没被 bash 解析的脚本文本抢走，导致后续命令莫名失败。
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y \
+apt-get update -y </dev/null
+apt-get install -y </dev/null \
     tigervnc-standalone-server \
     novnc \
     websockify \
@@ -66,9 +96,9 @@ done
 
 if [ -z "$PY_BIN" ]; then
     echo "   系统 Python 低于 3.12，通过 deadsnakes PPA 安装 python3.12..."
-    add-apt-repository -y ppa:deadsnakes/ppa
-    apt-get update -y
-    apt-get install -y python3.12 python3.12-venv python3.12-dev
+    add-apt-repository -y </dev/null ppa:deadsnakes/ppa
+    apt-get update -y </dev/null
+    apt-get install -y </dev/null python3.12 python3.12-venv python3.12-dev
 
     if command -v python3.12 >/dev/null 2>&1 && \
        python3.12 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)'; then
@@ -89,11 +119,11 @@ echo "   使用 Python: $PY_BIN ($("$PY_BIN" --version 2>&1))"
 if ! command -v google-chrome-stable >/dev/null 2>&1; then
     echo "🌐 [2/5] 下载并安装 Google Chrome..."
     CHROME_DEB="/tmp/google-chrome-stable_current_amd64.deb"
-    wget -q -O "$CHROME_DEB" \
+    wget -q -O "$CHROME_DEB" </dev/null \
         https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
 
     # dpkg -i 安装本地 deb；依赖缺失时用 apt-get -f install 自动补全
-    dpkg -i "$CHROME_DEB" || apt-get install -y -f
+    dpkg -i "$CHROME_DEB" </dev/null || apt-get install -y -f </dev/null
     rm -f "$CHROME_DEB"
 else
     echo "✅ [2/5] Google Chrome 已安装，跳过"
@@ -127,7 +157,7 @@ if [ -d "$CDP_DIR/venv" ] && \
 fi
 
 if [ ! -d "$CDP_DIR/venv" ]; then
-    "$PY_BIN" -m venv "$CDP_DIR/venv"
+    "$PY_BIN" -m venv "$CDP_DIR/venv" </dev/null
     echo "   虚拟环境已创建: $CDP_DIR/venv"
 else
     echo "   虚拟环境已存在，跳过创建"
@@ -164,16 +194,16 @@ VENV_BIN="$CDP_DIR/venv/bin"
 # ------------------------------------------------------------------------------
 echo "📦 [4/5] 安装 Python MCP 套件（虚拟环境隔离）..."
 
-"$VENV_PIP" install --upgrade pip setuptools wheel
+"$VENV_PIP" install --upgrade pip setuptools wheel </dev/null
 
 # 先固定基础约束，防止后续包升级覆盖
-"$VENV_PIP" install \
+"$VENV_PIP" install </dev/null \
     "setuptools<82" \
     "lxml~=5.3" \
     "click==8.3.3"
 
 # 安装核心包（mcp<2 与 fastmcp==3.4.2 是兼容性硬约束，理由见上方注释）
-"$VENV_PIP" install \
+"$VENV_PIP" install </dev/null \
     "mcp<2" \
     "fastmcp==3.4.2" \
     "browser-use[cli]==0.13.9" \
@@ -182,7 +212,7 @@ echo "📦 [4/5] 安装 Python MCP 套件（虚拟环境隔离）..."
     "mcp-proxy==0.12.0"
 
 # click 最后强制固定，防止上面任何包将其升级
-"$VENV_PIP" install --force-reinstall "click==8.3.3"
+"$VENV_PIP" install --force-reinstall "click==8.3.3" </dev/null
 
 # ------------------------------------------------------------------------------
 # 5. 安装完整性校验
@@ -337,7 +367,7 @@ vnc() {
         -SecurityTypes None \
         -AlwaysShared \
         -rfbport 5900 \
-        >"$log_dir/vnc.log" 2>&1 &
+        >"$log_dir/vnc.log" 2>&1 </dev/null &
     echo $! > "$pid_dir/vnc.pid"
 
     # 等待 X11 Socket 就绪（最多 6 秒）
@@ -356,7 +386,7 @@ vnc() {
     fi
 
     echo "🖥️  [vnc] 启动 Fluxbox 窗口管理器..."
-    DISPLAY=:99 fluxbox >"$log_dir/fluxbox.log" 2>&1 &
+    DISPLAY=:99 fluxbox >"$log_dir/fluxbox.log" 2>&1 </dev/null &
     echo $! > "$pid_dir/fluxbox.pid"
 
     # 等待 Fluxbox 完成初始化（避免 Chrome 启动时窗口管理器未就绪）
@@ -364,7 +394,7 @@ vnc() {
 
     echo "🖥️  [vnc] 启动 noVNC (websockify 6080)..."
     websockify --web=/usr/share/novnc 6080 localhost:5900 \
-        >"$log_dir/novnc.log" 2>&1 &
+        >"$log_dir/novnc.log" 2>&1 </dev/null &
     echo $! > "$pid_dir/websockify.pid"
 
     # 健康探测：确认 noVNC HTTP 服务真实响应
@@ -424,7 +454,7 @@ chr() {
     fi
 
     DISPLAY=:99 google-chrome-stable "${chrome_args[@]}" \
-        >"$log_dir/chrome.log" 2>&1 &
+        >"$log_dir/chrome.log" 2>&1 </dev/null &
     echo $! > "$pid_dir/chrome.pid"
 
     # 健康探测：轮询 CDP /json/version 接口确认 Chrome 真实就绪
@@ -477,7 +507,7 @@ buse() {
         --host 127.0.0.1 \
         -- \
         "$venv_bin/browser-use" --mcp \
-        >"$log_dir/buse.log" 2>&1 &
+        >"$log_dir/buse.log" 2>&1 </dev/null &
     echo $! > "$pid_dir/buse.pid"
 
     # 先确认进程没有立刻退出，再确认端口真的在监听（避免"假成功"）
@@ -527,7 +557,7 @@ crwl() {
         --host 127.0.0.1 \
         -- \
         "$venv_bin/crawl-mcp" \
-        >"$log_dir/crwl.log" 2>&1 &
+        >"$log_dir/crwl.log" 2>&1 </dev/null &
     echo $! > "$pid_dir/crwl.pid"
 
     # 先确认进程没有立刻退出，再确认端口真的在监听（避免"假成功"）
@@ -695,6 +725,9 @@ echo "   crwl     — 重启 Crawl-MCP (127.0.0.1:8002)"
 echo "   st       — 查看全部服务运行状态"
 echo "   logs     — 实时追踪全部日志"
 echo "   stop_all — 停止全部服务"
+echo ""
+echo "   一键安装（支持管道，无需先落盘）"
+echo "     curl -fsSL <脚本地址> | sudo bash"
 echo ""
 echo "   网络访问（需通过 Tailscale 隧道）"
 echo "   noVNC 桌面:     http://<tailscale-ip>:6080/vnc.html"
