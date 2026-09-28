@@ -78,36 +78,75 @@ apt-get install -y </dev/null \
     git
 
 # ------------------------------------------------------------------------------
-# 1.5 确保 Python >= 3.12 可用
-#     修复：crawl-mcp 全系列均声明 requires-python >=3.12，而 Ubuntu 22.04
-#           自带的 python3 只有 3.10，直接建 venv 会在装 crawl-mcp 时失败。
-#           这里优先复用系统已有版本，缺则通过 deadsnakes PPA 安装 3.12。
+# 1.5 确保 Python >= 3.12 可用，且能真正创建虚拟环境
+#     修复 A：crawl-mcp 全系列均声明 requires-python >=3.12，而 Ubuntu 22.04
+#             自带的 python3 只有 3.10，直接建 venv 会在装 crawl-mcp 时失败。
+#     修复 B：不能只看版本号。若系统里有 python3.13 但没装 python3.13-venv，
+#             `python3.13 -m venv` 会在 ensurepip 阶段报
+#             "Error: Command '[...ensurepip...]' returned non-zero exit status 1"。
+#             这里改为实测建一个临时 venv 来判定解释器是否真正可用。
 # ------------------------------------------------------------------------------
-echo "🐍 [1.5] 检查 Python 版本 (>=3.12)..."
+echo "🐍 [1.5] 检查 Python 版本 (>=3.12) 与 venv/ensurepip 可用性..."
 
-PY_BIN=""
-for cand in python3.13 python3.12 python3; do
-    if command -v "$cand" >/dev/null 2>&1 && \
-       "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null; then
-        PY_BIN="$(command -v "$cand")"
-        break
+# 实测：只有能建出「带 pip」的虚拟环境才算合格
+#   用法: _venv_ok <解释器绝对路径>
+_venv_ok() {
+    local py="$1" t
+    t="$(mktemp -d 2>/dev/null)" || return 1
+    if "$py" -m venv "$t/probe" >/dev/null 2>&1 && [ -x "$t/probe/bin/pip" ]; then
+        rm -rf "$t"
+        return 0
     fi
-done
+    rm -rf "$t"
+    return 1
+}
 
+# 从候选中挑出第一个「版本 >=3.12 且能建 venv」的解释器（stdout 返回路径）
+pick_py() {
+    local cand
+    for cand in python3.13 python3.12 python3; do
+        command -v "$cand" >/dev/null 2>&1 || continue
+        "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null || continue
+        if _venv_ok "$(command -v "$cand")"; then
+            command -v "$cand"
+            return 0
+        fi
+        echo "   ⚠️  $cand 版本达标但无法创建虚拟环境（多半缺 ${cand}-venv）" >&2
+    done
+    return 1
+}
+
+PY_BIN="$(pick_py)" || PY_BIN=""
+
+# ② 先尝试给「版本达标但缺 venv」的解释器补装对应 -venv 包（比重加 PPA 便宜）
 if [ -z "$PY_BIN" ]; then
-    echo "   系统 Python 低于 3.12，通过 deadsnakes PPA 安装 python3.12..."
+    for cand in python3.13 python3.12 python3; do
+        command -v "$cand" >/dev/null 2>&1 || continue
+        "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null || continue
+        echo "   尝试为 $cand 补装 ${cand}-venv ..."
+        if apt-get install -y </dev/null "${cand}-venv"; then
+            if _venv_ok "$(command -v "$cand")"; then
+                PY_BIN="$(command -v "$cand")"
+                break
+            fi
+        fi
+    done
+fi
+
+# ③ 仍不行 → deadsnakes PPA 安装 python3.12
+if [ -z "$PY_BIN" ]; then
+    echo "   通过 deadsnakes PPA 安装 python3.12 ..."
     add-apt-repository -y </dev/null ppa:deadsnakes/ppa
     apt-get update -y </dev/null
     apt-get install -y </dev/null python3.12 python3.12-venv python3.12-dev
 
-    if command -v python3.12 >/dev/null 2>&1 && \
-       python3.12 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)'; then
+    if command -v python3.12 >/dev/null 2>&1 && _venv_ok "$(command -v python3.12)"; then
         PY_BIN="$(command -v python3.12)"
     fi
 fi
 
 if [ -z "$PY_BIN" ]; then
-    echo "❌ 无法获得 Python >= 3.12，crawl-mcp 无法安装，请检查网络/PPA 可用性" >&2
+    echo "❌ 无法获得可用的 Python >= 3.12（需能创建虚拟环境），请检查网络/PPA 可用性" >&2
     exit 1
 fi
 echo "   使用 Python: $PY_BIN ($("$PY_BIN" --version 2>&1))"
@@ -149,18 +188,27 @@ CDP_DIR="$REAL_HOME/cdp"
 mkdir -p "$CDP_DIR/logs" "$CDP_DIR/pids" "$CDP_DIR/profile"
 chmod 700 "$CDP_DIR/profile"
 
-# 修复：若已存在的 venv 是用 <3.12 的 Python 建的，crawl-mcp 装不上，必须重建
-if [ -d "$CDP_DIR/venv" ] && \
-   ! "$CDP_DIR/venv/bin/python" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null; then
-    echo "   现有虚拟环境 Python 低于 3.12，删除重建..."
-    rm -rf "$CDP_DIR/venv"
+# 校验已有 venv 是否完整可用：Python>=3.12 且 pip 可用。
+# 修复：venv 创建在 ensurepip 阶段失败时，会留下一个「有 python、没有 pip」的
+#       残缺目录。只查版本号会误判为"已存在"，后续调用 $VENV_PIP 就会报
+#       "No such file or directory"。
+VENV_READY=0
+if [ -d "$CDP_DIR/venv" ]; then
+    if "$CDP_DIR/venv/bin/python" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null \
+       && [ -x "$CDP_DIR/venv/bin/pip" ] \
+       && "$CDP_DIR/venv/bin/pip" --version >/dev/null 2>&1; then
+        VENV_READY=1
+        echo "   虚拟环境已存在且完整，跳过创建"
+    else
+        echo "   现有虚拟环境不完整（Python 版本不符或缺少 pip），删除重建..."
+        rm -rf "$CDP_DIR/venv"
+    fi
 fi
 
-if [ ! -d "$CDP_DIR/venv" ]; then
+if [ "$VENV_READY" -eq 0 ]; then
+    echo "   创建虚拟环境: $CDP_DIR/venv"
     "$PY_BIN" -m venv "$CDP_DIR/venv" </dev/null
     echo "   虚拟环境已创建: $CDP_DIR/venv"
-else
-    echo "   虚拟环境已存在，跳过创建"
 fi
 
 VENV_PIP="$CDP_DIR/venv/bin/pip"
