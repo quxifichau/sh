@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # vccc_bf1.sh — Chrome + VNC + 双 MCP 自动化生产环境 一键安装脚本
+#
+# 两种安装方式（推荐 source 方式）：
+#   root 下 `. vccc.sh`（或 `source vccc.sh`）— 装完当前终端立即可用
+#       chr/buse/st 等快捷命令（脚本内部会 source ~/.functions.sh）
+#   `sudo bash vccc.sh` — 子进程无法把函数传回当前终端，装完需手动执行
+#       一次 `. ~/.functions.sh`；新开的终端自动加载
+#
 # 基于 vccc_gemini.sh 的修复版本（原文件不改动，修复内容另存为本文件）：
 #   1. 【Bug 修复】crawl-mcp==0.3.3 在 PyPI 上不存在（最高仅 0.2.0），
 #      pip 直接 404 —— 改为锁定真实存在的 crawl-mcp==0.2.0
@@ -25,6 +32,25 @@ case "${BASH_VERSION:-}${ZSH_VERSION:-}${KSH_VERSION:-}" in
   "") : ;;
   *) set -o pipefail 2>/dev/null || true ;;
 esac
+
+# ------------------------------------------------------------------------------
+# 0a. 检测本脚本是被 source/. 加载还是被执行
+#     - source 方式（root 下 `. vccc.sh`）：第 8 步的 `. ~/.functions.sh` 会把
+#       chr/buse/st 等快捷函数直接留在当前终端，装完立即可用
+#     - 执行方式（`bash vccc.sh`）：子进程无法把函数传回父 shell，装完需在
+#       当前终端手动执行一次 `. ~/.functions.sh`（新终端自动加载）
+# ------------------------------------------------------------------------------
+_CCC_SOURCED=0
+if [ -n "${BASH_SOURCE:-}" ] && [ "${BASH_SOURCE[0]}" != "$0" ]; then
+    _CCC_SOURCED=1
+fi
+
+# source 方式下非 root 禁止继续：脚本中途失败时的 exit 会直接关掉用户终端
+if [ "$_CCC_SOURCED" -eq 1 ] && [ "$(id -u)" -ne 0 ]; then
+    echo "❌ 以 source 方式安装必须是 root（否则脚本出错时的 exit 会关闭你的终端）" >&2
+    echo "   请改用: sudo bash $0" >&2
+    return 1
+fi
 
 # ------------------------------------------------------------------------------
 # 0. 前置检查：必须以 root 运行（apt-get / dpkg 需要）
@@ -720,11 +746,26 @@ crwl                 # 4. Crawl-MCP（依赖 Chrome 已就绪）
 
 st                   # 5. 输出最终健康状态
 
+# source 方式安装时，把脚本内部用的严格选项从当前交互 shell 上摘掉，
+# 避免 set -e/-u 影响用户后续手敲命令
+if [ "$_CCC_SOURCED" -eq 1 ]; then
+    set +eu
+    set +o pipefail 2>/dev/null || true
+fi
+
 echo ""
 echo "=================================================="
 echo "🎉 安装完成！全部服务已启动"
 echo ""
-echo "   快捷命令（新终端需先执行: . ~/.functions.sh）"
+if [ "$_CCC_SOURCED" -eq 1 ]; then
+    echo "   ✅ 本次以 source 方式安装，当前终端已可直接使用快捷命令"
+else
+    echo "   ⚡ 想在当前终端立刻使用快捷命令，请执行一次:"
+    echo "      . \"\$HOME/.functions.sh\""
+    echo "      （新开的终端会自动加载，无需任何命令）"
+fi
+echo ""
+echo "   快捷命令一览:"
 echo "   vnc      — 重启图形桌面 + noVNC (6080)"
 echo "   chr      — 重启 Chrome (CDP 127.0.0.1:9222)"
 echo "   buse     — 重启 Browser-use MCP (127.0.0.1:8001)"
