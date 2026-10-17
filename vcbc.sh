@@ -24,6 +24,16 @@
 #   4. 【Bug 修复】mcp-proxy 0.9.0 与 browser-use 钉死的 mcp==2.1.1 不兼容，
 #      启动即崩溃 —— 改用 fastmcp==4.0.10 把 stdio MCP 代理成 SSE
 #   5. 保留原脚本全部兼容性修复（POSIX sh/dash、curl 23 EPIPE、幂等注入等）
+#   6. 【性能修复】crawl4ai 的浏览器渲染回退因 Playwright Chromium 缺失而必崩
+#      （BrowserType.launch: Executable doesn't exist at ~/.cache/ms-playwright/...），
+#      导致 crawl_batch 不可用、crawl_single 只能走快速抽取 —— 新增第 4b 步
+#      `playwright install --with-deps chromium`，并在第 5 步校验可执行文件真实存在
+#   7. 【性能优化】新增 crawl-helper 本地批量抓取 MCP 服务（第 4c 步写入
+#      ~/cdp/crawl_helper.py，第 6 步随 crwl() 一并代理到 8002 端口）：
+#      提供 crawl_urls_to_file(urls, out_path, concurrent) 工具，抓取循环全部在
+#      远端本机并发完成、合并 markdown 落盘并随响应返回 —— 外部 Agent 一次调用
+#      即可完成整批抓取，不再让几十个 HTML 大 payload 穿隧道
+#      （约定：browser-use 侧不配 LLM key，正文提取只用 get_html(selector=...)）
 # ==============================================================================
 
 # 兼容 POSIX sh（dash 不支持 pipefail，仅在 bash/zsh/ksh 下启用）
@@ -210,6 +220,178 @@ run_pip \
 run_pip --force-reinstall "click==8.3.3"
 
 # ------------------------------------------------------------------------------
+# 4b. 安装 Playwright Chromium（修复 crawl4ai 浏览器渲染回退）
+#     crawl4ai 的快速抽取（fast-extract）失败时会回退到 Playwright 渲染，
+#     但 Playwright 自带的 Chromium 需要单独下载，缺失时报：
+#       BrowserType.launch: Executable doesn't exist at
+#       /root/.cache/ms-playwright/chromium-*/chrome-linux*/chrome
+#     导致 crawl_batch 整体崩溃、crawl_single 只能依赖快速抽取。
+#     --with-deps 会用 apt 补齐系统库；失败时降级为纯浏览器下载
+#     （Chrome 官方包已把绝大多数依赖装齐）。
+# ------------------------------------------------------------------------------
+echo "🎭 [4b/6] 安装 Playwright Chromium（crawl4ai 渲染回退依赖）..."
+if ! "$VENV_PY" -m playwright install --with-deps chromium; then
+    echo "   --with-deps 安装失败，降级为仅下载浏览器..."
+    "$VENV_PY" -m playwright install chromium
+fi
+
+# ------------------------------------------------------------------------------
+# 4c. 写入 crawl-helper 本地批量抓取 MCP 服务
+#     目的：把「几十个 URL 逐个抓取」的循环从外部 Agent 侧搬到远端本机，
+#     外部只需一次 MCP 调用（crawl_urls_to_file），大 HTML 不再穿隧道。
+#     随 crwl() 与 crawl-mcp 一起被 fastmcp 代理到 127.0.0.1:8002/sse。
+# ------------------------------------------------------------------------------
+echo "🧰 [4c/6] 写入 crawl-helper 批量抓取服务 ($CDP_DIR/crawl_helper.py)..."
+cat > "$CDP_DIR/crawl_helper.py" << 'CRAWL_HELPER_EOF'
+#!/usr/bin/env python3
+# ==============================================================================
+# crawl_helper.py — 远端本机批量抓取 MCP 服务（补充 crawl-mcp，由 vcbc.sh 写入）
+#
+# 工具:
+#   crawl_urls_to_file(urls, out_path, concurrent=5, header_title, return_content)
+#     在远端本机并发抓取全部 URL 正文（crawl4ai，含浏览器渲染回退），
+#     合并为一个 markdown 文件写入 out_path，并返回 JSON 摘要；
+#     return_content=True 时摘要附带全文（一次调用拿到最终产物）。
+# ==============================================================================
+import asyncio
+import json
+import os
+from typing import List
+
+from fastmcp import FastMCP
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
+
+mcp = FastMCP("crawl-helper")
+
+
+def _md_of(result) -> str:
+    """兼容 crawl4ai 各版本的 markdown 取值。"""
+    md = getattr(result, "markdown", None)
+    for attr in ("fit_markdown", "raw_markdown"):
+        val = getattr(md, attr, None)
+        if val:
+            md = val
+            break
+    if isinstance(md, list):
+        md = "\n".join(str(x) for x in md)
+    return (md or "").strip() if isinstance(md, str) else ""
+
+
+def _title_of(result) -> str:
+    meta = getattr(result, "metadata", None) or {}
+    if isinstance(meta, dict):
+        return str(meta.get("title") or meta.get("og:title") or "")
+    return ""
+
+
+@mcp.tool()
+async def crawl_urls_to_file(
+    urls: List[str],
+    out_path: str,
+    concurrent: int = 5,
+    header_title: str = "抓取结果",
+    return_content: bool = True,
+) -> str:
+    """批量抓取 URL 列表的网页正文，合并为 markdown 文件（远端本机完成）。
+
+    Args:
+        urls: 待抓取的 URL 列表（保持顺序编号）。
+        out_path: 合并后 markdown 的输出路径（如 /content/results.md）。
+        concurrent: 并发数（1-10，默认 5）。
+        header_title: 输出文件的大标题。
+        return_content: True 时响应 JSON 附带合并后的全文。
+
+    Returns:
+        JSON 字符串: {ok, out_path, total, success, failed[], bytes, content?}
+    """
+    if not urls:
+        return json.dumps({"ok": False, "error": "urls 为空"}, ensure_ascii=False)
+
+    sem = asyncio.Semaphore(max(1, min(int(concurrent or 5), 10)))
+    records: list = [None] * len(urls)
+
+    browser_cfg = BrowserConfig(headless=True, verbose=False)
+    run_cfg = CrawlerRunConfig(
+        cache_mode=CacheMode.BYPASS,
+        page_timeout=60000,
+        wait_until="domcontentloaded",
+        verbose=False,
+    )
+
+    async with AsyncWebCrawler(config=browser_cfg) as crawler:
+
+        async def work(i: int, url: str) -> None:
+            async with sem:
+                rec = {"url": url, "ok": False, "title": "", "markdown": "", "error": ""}
+                try:
+                    r = await crawler.arun(url=url, config=run_cfg)
+                    if r is None:
+                        rec["error"] = "无结果返回"
+                    elif not r.success:
+                        rec["error"] = str(getattr(r, "error_message", "") or "抓取失败")[:300]
+                    else:
+                        md = _md_of(r)
+                        rec["title"] = _title_of(r)
+                        if len(md) > 50:
+                            rec["ok"] = True
+                            rec["markdown"] = md
+                        else:
+                            rec["error"] = f"正文过短（{len(md)} 字符），疑似验证页/空壳页"
+                except Exception as e:  # noqa: BLE001
+                    rec["error"] = f"{type(e).__name__}: {e}"[:300]
+                records[i] = rec
+
+        await asyncio.gather(*(work(i, u) for i, u in enumerate(urls)))
+
+    ok_n = sum(1 for r in records if r and r["ok"])
+    lines = [
+        f"# {header_title}",
+        "",
+        f"- URL 总数: {len(urls)}",
+        f"- 抓取成功: {ok_n}",
+        f"- 抓取失败: {len(urls) - ok_n}",
+        "",
+        "---",
+        "",
+    ]
+    for i, r in enumerate(records, 1):
+        r = r or {"url": urls[i - 1], "ok": False, "title": "", "markdown": "", "error": "未完成"}
+        head = r["title"] or r["url"]
+        lines.append(f"## [{i}] {head}")
+        lines.append("")
+        lines.append(f"- URL: {r['url']}")
+        lines.append(f"- 状态: {'成功' if r['ok'] else '失败 — ' + (r['error'] or '未知原因')}")
+        lines.append("")
+        lines.append(r["markdown"] if r["ok"] else "（正文抓取失败）")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+    content = "\n".join(lines)
+
+    out_path = os.path.abspath(out_path)
+    os.makedirs(os.path.dirname(out_path) or "/", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    resp = {
+        "ok": True,
+        "out_path": out_path,
+        "total": len(urls),
+        "success": ok_n,
+        "failed": [{"url": r["url"], "error": r["error"]} for r in records if r and not r["ok"]],
+        "bytes": len(content.encode("utf-8")),
+    }
+    if return_content:
+        resp["content"] = content
+    return json.dumps(resp, ensure_ascii=False)
+
+
+if __name__ == "__main__":
+    mcp.run()
+CRAWL_HELPER_EOF
+chmod +x "$CDP_DIR/crawl_helper.py"
+
+# ------------------------------------------------------------------------------
 # 5. 安装完整性校验（使用 POSIX 循环，兼容 dash/ash）
 #    新增：对 browser-use / fastmcp 做 CLI 冒烟测试，确保入口真实可用
 # ------------------------------------------------------------------------------
@@ -238,6 +420,31 @@ if ! "$VENV_BIN/browser-use" --help >/dev/null 2>&1; then
 fi
 if ! "$VENV_BIN/fastmcp" version >/dev/null 2>&1; then
     echo "❌ fastmcp CLI 冒烟测试失败" >&2
+    exit 1
+fi
+
+# Playwright Chromium 校验：确认渲染回退所需的可执行文件真实存在
+if ! "$VENV_PY" -c '
+import os
+from playwright.sync_api import sync_playwright
+with sync_playwright() as p:
+    exe = p.chromium.executable_path
+    assert exe and os.path.exists(exe), f"缺失: {exe}"
+    print("   Playwright Chromium:", exe)
+'; then
+    echo "❌ Playwright Chromium 校验失败（crawl4ai 渲染回退将不可用）" >&2
+    exit 1
+fi
+
+# crawl-helper 冒烟测试：模块能被完整导入（FastMCP 实例化 + crawl4ai 依赖链完好）
+if ! "$VENV_PY" -c "
+import importlib.util
+spec = importlib.util.spec_from_file_location('crawl_helper', '$CDP_DIR/crawl_helper.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+assert hasattr(mod, 'mcp'), 'crawl_helper 缺少 mcp 实例'
+"; then
+    echo "❌ crawl-helper 冒烟测试失败: $CDP_DIR/crawl_helper.py" >&2
     exit 1
 fi
 
@@ -554,7 +761,10 @@ BUSE_MCP_JSON_EOF
 #
 #   实现说明：
 #     同 buse，用 fastmcp 把 stdio 的 crawl-mcp 代理为 SSE。
-#     注：crawl-mcp 0.2.0 会启动自身的无头浏览器，不使用外部 CDP 地址。
+#     注：crawl-mcp 0.2.0 会启动自身的无头浏览器（Playwright Chromium，
+#     已由第 4b 步安装），不使用外部 CDP 地址。
+#     同时把 crawl-helper（~/cdp/crawl_helper.py）作为第二个 stdio server
+#     合并代理到同一端口，对外新增 crawl_urls_to_file 批量抓取工具。
 # ==============================================================================
 crwl() {
     local venv_bin="$_VENV_BIN"
@@ -568,12 +778,24 @@ crwl() {
         return 1
     fi
 
-    # 生成 crawl-mcp 的 stdio MCPConfig
+    if [ ! -f "$cdp_dir/crawl_helper.py" ]; then
+        echo "❌ [crwl] 找不到 $cdp_dir/crawl_helper.py，请重新运行 vccc_bf1.sh" >&2
+        return 1
+    fi
+
+    # 生成 crawl-mcp + crawl-helper 的 stdio MCPConfig（fastmcp 合并代理）
     cat > "$cdp_dir/crwl-mcp.json" << CRWL_MCP_JSON_EOF
 {
   "mcpServers": {
     "crawl-mcp": {
       "command": "$venv_bin/crawl-mcp",
+      "env": {
+        "DISPLAY": ":99"
+      }
+    },
+    "crawl-helper": {
+      "command": "$venv_bin/python",
+      "args": ["$cdp_dir/crawl_helper.py"],
       "env": {
         "DISPLAY": ":99"
       }
@@ -778,4 +1000,8 @@ echo "   网络访问（需通过 Tailscale 隧道）"
 echo "   noVNC 桌面:     http://<tailscale-ip>:6080/vnc.html"
 echo "   Browser-use MCP: http://<tailscale-ip>:8001/sse"
 echo "   Crawl-MCP:       http://<tailscale-ip>:8002/sse"
+echo ""
+echo "   批量抓取（推荐外部 Agent 使用，一次调用完成整批）:"
+echo "   crawl_urls_to_file(urls, out_path, concurrent=5)  ← 8002 端口 crawl-helper 提供"
+echo "   正文提取约定: browser-use 只用 get_html(selector=...)，不依赖 extract_content"
 echo "=================================================="
