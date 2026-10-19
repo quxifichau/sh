@@ -35,9 +35,9 @@ fi
 echo "⏳ 开始安装 Sing-box..."
 
 # curl -fsSL https://sing-box.app/install.sh | bash
-# 或者直接上传安装sing-box_1.14.2_linux_amd64.deb
-
-sudo dpkg -i sing-box_1.14.2_linux_amd64.deb
+# 或者直接上传安装sing-box.deb
+curl -fL --retry 3 -o sing-box.deb https://ghproxy.net/https://github.com/SagerNet/sing-box/releases/download/v1.15.0-alpha.12/sing-box_1.15.0-alpha.12_linux_amd64.deb
+sudo dpkg -i sing-box.deb
 
 sing-box version || { echo "❌ Sing-box 安装失败"; exit 1; }
 
